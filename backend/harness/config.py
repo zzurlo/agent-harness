@@ -123,8 +123,10 @@ class ContextPolicy:
 
 @dataclass(frozen=True)
 class Settings:
-    project_endpoint: str = os.getenv("FOUNDRY_PROJECT_ENDPOINT", "")
-    api_key: str | None = os.getenv("FOUNDRY_API_KEY") or None
+    # Direct model endpoint, not the Agent Service /api/projects/... endpoint.
+    model_endpoint: str = field(default_factory=lambda: os.getenv("FOUNDRY_MODEL_ENDPOINT", ""))
+    project_endpoint: str = field(default_factory=lambda: os.getenv("FOUNDRY_PROJECT_ENDPOINT", ""))
+    api_key: str | None = field(default_factory=lambda: os.getenv("FOUNDRY_API_KEY") or None)
     api_version: str = os.getenv("FOUNDRY_API_VERSION", "2024-10-21")
     system_prompt: str = os.getenv(
         "SYSTEM_PROMPT",
