@@ -40,6 +40,10 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="agent-harness", version="0.1.0", lifespan=lifespan)
 
+# Last registered is outermost: CORS validates preflights and decorates 401/503.
+from api.auth import OwnerAuthMiddleware
+
+app.add_middleware(OwnerAuthMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,
