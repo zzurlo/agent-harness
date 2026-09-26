@@ -14,8 +14,9 @@ import asyncio
 import json
 import logging
 import time
-from dataclasses import dataclass, field
-from typing import Any, AsyncIterator
+from collections.abc import AsyncIterator
+from dataclasses import dataclass
+from typing import Any
 
 from .config import ROUTES, settings
 from .context import COMPACTION_PROMPT, Conversation, render_for_summary
@@ -139,7 +140,7 @@ class Harness:
             registry.schemas() if (enable_tools and route.supports_tools) else None
         )
 
-        for step in range(budgets.max_tool_calls_per_turn + 1):
+        for _step in range(budgets.max_tool_calls_per_turn + 1):
             if time.perf_counter() - started > budgets.max_wall_clock_seconds:
                 yield _event("budget_exceeded", reason="wall_clock")
                 break
@@ -217,7 +218,7 @@ class Harness:
                     fut = approvals.create(call["id"])
                     try:
                         approved = await asyncio.wait_for(fut, timeout=120)
-                    except asyncio.TimeoutError:
+                    except TimeoutError:
                         approved = False
                     if not approved:
                         self._add_tool_result(

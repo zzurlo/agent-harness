@@ -7,8 +7,6 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-import pytest
-
 from harness.context import Conversation
 from harness.loop import Harness
 from harness.providers import foundry

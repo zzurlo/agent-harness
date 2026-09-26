@@ -93,7 +93,7 @@ class ToolRegistry:
                     asyncio.to_thread(tool.fn, **args), timeout=timeout
                 )
             return {"ok": True, "result": result, "elapsed": round(time.perf_counter() - started, 3)}
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return {
                 "error": f"Tool '{name}' exceeded {timeout}s and was cancelled.",
                 "retryable": True,
@@ -123,7 +123,7 @@ def _build_schema(fn: t.Callable) -> dict:
 
         if origin is t.Literal:
             props[pname] = {"type": "string", "enum": list(t.get_args(hint))}
-        elif origin in (list, t.List):
+        elif origin in (list, list):
             props[pname] = {"type": "array", "items": {"type": "string"}}
         else:
             # Unwrap Optional[X] -> X

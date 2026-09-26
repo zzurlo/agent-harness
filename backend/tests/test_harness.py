@@ -4,8 +4,6 @@ No network. These run in CI without a Foundry deployment.
 """
 from __future__ import annotations
 
-import pytest
-
 from harness.config import ROUTES
 from harness.context import Conversation, count_tokens
 from harness.router import select_route

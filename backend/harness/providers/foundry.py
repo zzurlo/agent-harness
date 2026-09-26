@@ -12,8 +12,9 @@ Auth order:
 from __future__ import annotations
 
 import logging
+from collections.abc import AsyncIterator
 from functools import lru_cache
-from typing import Any, AsyncIterator
+from typing import Any
 
 from openai import AsyncOpenAI
 

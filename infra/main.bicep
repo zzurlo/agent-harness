@@ -23,8 +23,22 @@ param name string = 'agentharness'
 ])
 param location string = 'centralus'
 
-@description('Container image for the backend.')
+@description('''
+Container image for the backend.
+
+Leave as the default placeholder on FIRST deploy. There is an ordering problem
+otherwise: the container app cannot pull from ACR until its managed identity
+has the AcrPull role, but that role assignment needs the identity's principalId,
+which only exists after the app is created. And on a brand-new registry the
+image has not been pushed yet regardless.
+
+So: deploy once with the public placeholder, then let the backend workflow
+build and push the real image via `az containerapp update`.
+''')
 param containerImage string = 'mcr.microsoft.com/k8se/quickstart:latest'
+
+@description('True once a real image exists in ACR. Enables the ACR registry binding.')
+param useAcrImage bool = false
 
 @description('Foundry project endpoint, e.g. https://<res>.services.ai.azure.com/api/projects/<proj>')
 param foundryProjectEndpoint string = ''
@@ -108,12 +122,14 @@ resource api 'Microsoft.App/containerApps@2024-03-01' = {
           allowedHeaders: ['*']
         }
       }
-      registries: [
+      // On first deploy this is empty: binding ACR before the AcrPull role
+      // exists makes the app fail to start.
+      registries: useAcrImage ? [
         {
           server: acr.properties.loginServer
           identity: 'system'
         }
-      ]
+      ] : []
       secrets: [
         {
           name: 'tables-connection'
