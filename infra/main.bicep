@@ -1,9 +1,10 @@
 // Infrastructure for agent-harness.
 //
-// Cost posture: everything here is free-tier or scale-to-zero.
+// Cost posture: low idle cost, not zero total cost. ACR Basic has a paid baseline.
+// A daily log quota is not a hard monthly currency cap.
 //   Static Web Apps  Free   -> $0
 //   Container Apps   min=0  -> $0 idle, ~$0-5/mo active
-//   Log Analytics    capped -> $0-3/mo
+//   Log Analytics    capped -> usage billed; set Azure budget alerts
 //   Storage (Tables)        -> pennies
 // Deliberately NO Postgres: a B1ms Flexible Server would be ~$13/mo, more than
 // every other line item combined.
@@ -13,7 +14,7 @@ targetScope = 'resourceGroup'
 @description('Base name for all resources.')
 param name string = 'agentharness'
 
-@description('Location. Must support the Foundry Responses API.')
+@description('Location for app infrastructure; model availability is verified separately.')
 @allowed([
   'centralus'
   'eastus'
@@ -33,18 +34,33 @@ which only exists after the app is created. And on a brand-new registry the
 image has not been pushed yet regardless.
 
 So: deploy once with the public placeholder, then let the backend workflow
-build and push the real image via `az containerapp update`.
+build the real image and apply it with scripts/deploy.py.
 ''')
 param containerImage string = 'mcr.microsoft.com/k8se/quickstart:latest'
 
 @description('True once a real image exists in ACR. Enables the ACR registry binding.')
 param useAcrImage bool = false
 
-@description('Foundry project endpoint, e.g. https://<res>.services.ai.azure.com/api/projects/<proj>')
-param foundryProjectEndpoint string = ''
+@description('Preserve in what-if; refresh on real deployment so token rotations take effect.')
+param revisionSuffix string = ''
 
-@description('Allowed CORS origins (the SWA hostname).')
-param corsOrigins string = ''
+@description('Server-only bearer token. Required for a real image; scripts/deploy.py validates strength.')
+@secure()
+param appAccessToken string = ''
+
+@description('Live environment, secrets and registries preserved by scripts/deploy.py. Never supply through CLI argv.')
+@secure()
+param runtimeConfig object
+
+// Use scripts/deploy.py, not raw defaults, for every routine infrastructure rerun.
+var defaultEnv = {
+  CORS_ORIGINS: { name: 'CORS_ORIGINS', value: 'https://${swa.properties.defaultHostname}' }
+  LOG_LEVEL: { name: 'LOG_LEVEL', value: 'INFO' }
+  TABLES_CONNECTION_STRING: { name: 'TABLES_CONNECTION_STRING', secretRef: 'tables-connection' }
+}
+var runtimeEnv = union(defaultEnv, toObject(runtimeConfig.env, entry => entry.name, entry => entry), useAcrImage ? {
+  APP_ACCESS_TOKEN: { name: 'APP_ACCESS_TOKEN', secretRef: 'app-access-token' }
+} : {})
 
 var uniq = uniqueString(resourceGroup().id)
 
@@ -77,7 +93,7 @@ resource acr 'Microsoft.ContainerRegistry/registries@2023-11-01-preview' = {
 // Thread persistence -- Table Storage, not Postgres
 // ---------------------------------------------------------------------------
 resource storage 'Microsoft.Storage/storageAccounts@2023-05-01' = {
-  name: 'st${name}${uniq}'
+  name: 'st${take(name, 9)}${uniq}'
   location: location
   sku: { name: 'Standard_LRS' }
   kind: 'StorageV2'
@@ -111,33 +127,30 @@ resource api 'Microsoft.App/containerApps@2024-03-01' = {
   properties: {
     managedEnvironmentId: env.id
     configuration: {
+      activeRevisionsMode: 'Single'
       ingress: {
         external: true
-        targetPort: 8000
+        targetPort: useAcrImage ? 8000 : 80
         transport: 'auto'
         allowInsecure: false
-        corsPolicy: {
-          allowedOrigins: empty(corsOrigins) ? ['*'] : split(corsOrigins, ',')
-          allowedMethods: ['GET', 'POST', 'DELETE', 'OPTIONS']
-          allowedHeaders: ['*']
-        }
       }
-      // On first deploy this is empty: binding ACR before the AcrPull role
-      // exists makes the app fail to start.
-      registries: useAcrImage ? [
+      // Bootstrap identity must exist before AcrPull can be assigned.
+      // Azure adds null credential fields; replace by server, not whole-object equality.
+      registries: useAcrImage ? concat(filter(runtimeConfig.registries, registry => registry.server != acr.properties.loginServer), [
         {
           server: acr.properties.loginServer
           identity: 'system'
         }
-      ] : []
-      secrets: [
+      ]) : runtimeConfig.registries
+      secrets: concat(runtimeConfig.secrets, [
         {
           name: 'tables-connection'
           value: 'DefaultEndpointsProtocol=https;AccountName=${storage.name};AccountKey=${storage.listKeys().keys[0].value};EndpointSuffix=${environment().suffixes.storage}'
         }
-      ]
+      ], useAcrImage ? [{ name: 'app-access-token', value: appAccessToken }] : [])
     }
     template: {
+      revisionSuffix: revisionSuffix
       containers: [
         {
           name: 'api'
@@ -146,16 +159,11 @@ resource api 'Microsoft.App/containerApps@2024-03-01' = {
             cpu: json('0.5')
             memory: '1Gi'
           }
-          env: [
-            { name: 'FOUNDRY_PROJECT_ENDPOINT', value: foundryProjectEndpoint }
-            { name: 'CORS_ORIGINS', value: corsOrigins }
-            { name: 'TABLES_CONNECTION_STRING', secretRef: 'tables-connection' }
-            { name: 'LOG_LEVEL', value: 'INFO' }
-          ]
+          env: map(items(runtimeEnv), entry => entry.value)
           probes: [
             {
               type: 'Readiness'
-              httpGet: { path: '/health', port: 8000 }
+              httpGet: { path: useAcrImage ? '/health' : '/', port: useAcrImage ? 8000 : 80 }
               initialDelaySeconds: 3
               periodSeconds: 5
             }
@@ -165,7 +173,7 @@ resource api 'Microsoft.App/containerApps@2024-03-01' = {
       scale: {
         // THE cost lever: zero replicas when idle.
         minReplicas: 0
-        maxReplicas: 2
+        maxReplicas: 1
         rules: [
           {
             name: 'http-concurrency'

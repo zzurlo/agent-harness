@@ -10,8 +10,6 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
-import pytest
-
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 import verify_models as vm  # noqa: E402
@@ -30,6 +28,10 @@ def _call(name="get_weather", arguments='{"city": "Chicago"}'):
 
 class FakeClient:
     """Returns queued responses, or raises queued exceptions, in order."""
+
+    def with_options(self, **kwargs):
+        self.options = kwargs
+        return self
 
     def __init__(self, *outcomes):
         self._outcomes = list(outcomes)
@@ -107,21 +109,22 @@ async def test_malformed_tool_arguments_are_caught(monkeypatch):
     assert any("malformed JSON" in e for e in res.errors)
 
 
-async def test_missing_required_arg_warns(monkeypatch):
+async def test_missing_required_arg_fails(monkeypatch):
     _install(
         monkeypatch, FakeClient(_resp("ok"), _resp(None, [_call(arguments="{}")]))
     )
     res = await vm.probe_route("tools", timeout=5, skip_tools=False)
-    assert res.tools_work is True
-    assert any("'city'" in w for w in res.warnings)
-    assert not res.failed, "a missing arg is a warning, not a hard failure"
+    assert res.tools_work is False
+    assert any("'city'" in e for e in res.errors)
+    assert res.failed
 
 
-async def test_empty_content_warns_about_thinking_budget(monkeypatch):
+async def test_empty_content_fails_about_thinking_budget(monkeypatch):
     _install(monkeypatch, FakeClient(_resp("")))
     res = await vm.probe_route("think", timeout=5, skip_tools=True)
     assert res.reachable is True
-    assert any("thinking tokens" in w for w in res.warnings)
+    assert res.failed
+    assert any("thinking tokens" in e for e in res.errors)
 
 
 async def test_non_tool_route_skips_the_tool_probe(monkeypatch):
@@ -145,7 +148,7 @@ async def test_skip_tools_flag_is_respected(monkeypatch):
 async def test_timeout_is_reported(monkeypatch):
     import asyncio
 
-    class SlowClient:
+    class SlowClient(FakeClient):
         def __init__(self):
             async def create(**kwargs):
                 await asyncio.sleep(10)

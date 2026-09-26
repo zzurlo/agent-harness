@@ -38,14 +38,13 @@ from pathlib import Path
 # Make the harness importable when run as scripts/verify_models.py
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+_IMPORT_ERROR: Exception | None = None
 try:
     from harness.config import ROUTES, settings
-    from harness.providers.foundry import get_client
-except ImportError as exc:  # pragma: no cover
-    print(f"Could not import the harness package: {exc}", file=sys.stderr)
-    print("Run from backend/ with dependencies installed:", file=sys.stderr)
-    print("    cd backend && pip install -e '.[dev]'", file=sys.stderr)
-    sys.exit(2)
+    from harness.providers.foundry import close_client, get_client
+except Exception as exc:  # invalid env values must also produce machine JSON
+    _IMPORT_ERROR = exc
+    ROUTES, settings = {}, None
 
 
 GREEN, RED, YELLOW, DIM, BOLD, RESET = (
@@ -81,6 +80,7 @@ class RouteResult:
     latency_ms: int | None = None
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    configuration_error: bool = False
 
     @property
     def failed(self) -> bool:
@@ -99,20 +99,30 @@ class RouteResult:
         }
 
 
+def _credential_error(exc: Exception) -> bool:
+    from azure.core.exceptions import ClientAuthenticationError
+
+    return isinstance(exc, ClientAuthenticationError) or getattr(exc, "status_code", None) in (401, 403)
+
+
 def _explain(exc: Exception) -> str:
-    """Turn an SDK exception into something actionable."""
+    """Turn an SDK exception into something actionable without credential details."""
     text = str(exc)
     status = getattr(exc, "status_code", None)
+
+    if _credential_error(exc):
+        return (
+            "credential/auth rejected -- check the runtime managed identity's Foundry User "
+            "role on the model resource (not just the project), or az login for local dev; "
+            "alternatively set FOUNDRY_API_KEY. CI identity is not runtime identity."
+        )
+    if isinstance(exc, TimeoutError):
+        return "request timed out -- check model capacity and the verification time budget"
 
     if status == 404 or "DeploymentNotFound" in text or "does not exist" in text:
         return (
             "deployment not found -- check the name in Foundry portal under "
             "Models + Endpoints, and that it is in this project/region"
-        )
-    if status == 401 or status == 403:
-        return (
-            "auth rejected -- managed identity needs the Foundry User (formerly "
-            "Azure AI User) role on the project, or set FOUNDRY_API_KEY locally"
         )
     if status == 429:
         return "rate limited / no quota -- raise the deployment TPM or retry"
@@ -127,7 +137,14 @@ async def probe_route(name: str, timeout: float, skip_tools: bool) -> RouteResul
     route = ROUTES[name]
     res = RouteResult(route=name, deployment=route.deployment,
                       expects_tools=route.supports_tools)
-    client = get_client()
+    try:
+        # A copy shares the cached runtime HTTP client and refreshing credential,
+        # but disables SDK retries for deterministic, bounded verification.
+        client = get_client().with_options(max_retries=0, timeout=timeout)
+    except Exception as exc:
+        res.configuration_error = True
+        res.errors.append(_explain(exc))
+        return res
 
     # --- 1. reachability -------------------------------------------------
     loop = asyncio.get_running_loop()
@@ -137,7 +154,7 @@ async def probe_route(name: str, timeout: float, skip_tools: bool) -> RouteResul
             client.chat.completions.create(
                 model=route.deployment,
                 messages=[{"role": "user", "content": "Reply with the single word: ok"}],
-                max_tokens=16,
+                max_tokens=route.max_output_tokens,
                 temperature=0,
             ),
             timeout=timeout,
@@ -147,7 +164,7 @@ async def probe_route(name: str, timeout: float, skip_tools: bool) -> RouteResul
 
         content = (resp.choices[0].message.content or "").strip()
         if not content:
-            res.warnings.append(
+            res.errors.append(
                 "returned empty content -- reasoning models sometimes spend the "
                 "whole budget on thinking tokens; consider a higher max_output_tokens"
             )
@@ -155,6 +172,7 @@ async def probe_route(name: str, timeout: float, skip_tools: bool) -> RouteResul
         res.errors.append(f"no response within {timeout:.0f}s")
         return res
     except Exception as exc:  # noqa: BLE001
+        res.configuration_error = _credential_error(exc)
         res.errors.append(_explain(exc))
         return res
 
@@ -173,7 +191,7 @@ async def probe_route(name: str, timeout: float, skip_tools: bool) -> RouteResul
                 ],
                 tools=[PROBE_TOOL],
                 tool_choice="auto",
-                max_tokens=256,
+                max_tokens=route.max_output_tokens,
                 temperature=0,
             ),
             timeout=timeout,
@@ -188,20 +206,20 @@ async def probe_route(name: str, timeout: float, skip_tools: bool) -> RouteResul
                 "supports_tools=False."
             )
         else:
-            fn = calls[0].function
-            if fn.name != "get_weather":
-                res.warnings.append(f"called unexpected tool '{fn.name}'")
-            try:
-                args = json.loads(fn.arguments or "{}")
-                if "city" not in args:
-                    res.warnings.append(
-                        f"tool call omitted the required 'city' arg: {fn.arguments!r}"
-                    )
-            except json.JSONDecodeError:
-                res.errors.append(
-                    f"emitted malformed JSON arguments: {fn.arguments!r}"
-                )
+            for call in calls:
+                fn = call.function
+                if fn.name != "get_weather":
+                    res.errors.append("called unexpected tool; expected 'get_weather'")
+                try:
+                    args = json.loads(fn.arguments or "{}")
+                    if (not isinstance(args, dict) or not isinstance(args.get("city"), str)
+                            or not args["city"].strip()):
+                        res.errors.append("tool call requires a non-empty string 'city' arg")
+                except (json.JSONDecodeError, TypeError):
+                    res.errors.append("emitted malformed JSON arguments")
+            res.tools_work = not res.errors
     except Exception as exc:  # noqa: BLE001
+        res.configuration_error = _credential_error(exc)
         res.tools_work = False
         msg = _explain(exc)
         if "tool" in msg.lower() or "function" in msg.lower():
@@ -212,10 +230,42 @@ async def probe_route(name: str, timeout: float, skip_tools: bool) -> RouteResul
     return res
 
 
+async def verify_routes(
+    names: list[str] | None = None, timeout: float = 30.0,
+    skip_tools: bool = False, *, total_timeout: float = 90.0,
+) -> list[RouteResult]:
+    """Sequential runtime/CLI probes, bounded across all requests and retries.
+
+    Does not close the shared provider; its owner (CLI or app lifespan) does that.
+    Unfinished routes receive explicit failures when the total budget expires.
+    """
+    import math
+
+    if not all(math.isfinite(v) and v > 0 for v in (timeout, total_timeout)):
+        raise ValueError("Verification timeouts must be finite positive seconds")
+    names = list(dict.fromkeys(list(ROUTES) if names is None else names))
+    if not names or any(name not in ROUTES for name in names):
+        raise ValueError("Choose one or more configured route names")
+    results = []
+    try:
+        async with asyncio.timeout(total_timeout):
+            for name in names:
+                results.append(await probe_route(name, timeout, skip_tools))
+    except TimeoutError:
+        for name in names[len(results):]:
+            route = ROUTES[name]
+            results.append(RouteResult(
+                name, route.deployment, route.supports_tools,
+                errors=["verification time budget exhausted; retry this route separately"],
+            ))
+    return results
+
+
 def render(results: list[RouteResult]) -> None:
     print(f"\n{BOLD}Foundry model verification{RESET}")
-    print(f"{DIM}endpoint: {settings.project_endpoint or '(unset)'}{RESET}")
-    auth = "API key" if settings.api_key else "Entra ID (DefaultAzureCredential)"
+    endpoint = (settings.model_endpoint or settings.project_endpoint) if settings else ""
+    print(f"{DIM}endpoint: {endpoint or '(unset)'}{RESET}")
+    auth = "API key" if settings and settings.api_key else "Entra ID (DefaultAzureCredential)"
     print(f"{DIM}auth:     {auth}{RESET}\n")
 
     width = max(len(r.route) for r in results) + 2
@@ -250,38 +300,56 @@ def render(results: list[RouteResult]) -> None:
         print(f"{GREEN}All {len(results)} routes usable{extra}.{RESET}\n")
 
 
+class ConfigurationParser(argparse.ArgumentParser):
+    def error(self, message):
+        raise ValueError(message)
+
+
 async def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = ConfigurationParser(description=__doc__)
     parser.add_argument("--route", action="append", choices=sorted(ROUTES),
                         help="Only check this route (repeatable).")
-    parser.add_argument("--timeout", type=float, default=60.0,
-                        help="Per-request timeout in seconds (default: 60).")
+    parser.add_argument("--timeout", type=float, default=30.0,
+                        help="Per-request timeout in seconds, no SDK retries (default: 30).")
+    parser.add_argument("--total-timeout", type=float, default=90.0,
+                        help="Whole verification budget in seconds (default: 90).")
     parser.add_argument("--skip-tools", action="store_true",
                         help="Skip the tool-calling probe.")
     parser.add_argument("--json", action="store_true",
                         help="Emit JSON instead of a table.")
-    args = parser.parse_args()
-
-    if not settings.project_endpoint:
-        print("FOUNDRY_PROJECT_ENDPOINT is not set.", file=sys.stderr)
-        print("  export FOUNDRY_PROJECT_ENDPOINT="
-              "https://<res>.services.ai.azure.com/api/projects/<proj>",
-              file=sys.stderr)
+    try:
+        args = parser.parse_args()
+    except ValueError as exc:
+        results = [RouteResult("configuration", "", False,
+                               errors=[str(exc)[:300]], configuration_error=True)]
+        if "--json" in sys.argv:
+            print(json.dumps([r.as_dict() for r in results]))
+        else:
+            render(results)
         return 2
 
-    names = args.route or list(ROUTES)
-
-    # Sequential on purpose: parallel probes against a fresh deployment tend to
-    # trip rate limits and produce misleading 429 failures.
-    results = []
-    for name in names:
-        results.append(await probe_route(name, args.timeout, args.skip_tools))
+    try:
+        if _IMPORT_ERROR is not None:
+            raise RuntimeError(
+                "Cannot load harness configuration/dependencies; check numeric budget env vars "
+                "and install backend dependencies with pip install -e '.[dev]'."
+            ) from _IMPORT_ERROR
+        results = await verify_routes(args.route, args.timeout, args.skip_tools,
+                                      total_timeout=args.total_timeout)
+    except Exception as exc:
+        results = [RouteResult("configuration", "", False,
+                               errors=[str(exc)[:300]], configuration_error=True)]
+    finally:
+        if _IMPORT_ERROR is None:
+            await close_client()
 
     if args.json:
         print(json.dumps([r.as_dict() for r in results], indent=2))
     else:
         render(results)
 
+    if any(r.configuration_error for r in results):
+        return 2
     return 1 if any(r.failed for r in results) else 0
 
 

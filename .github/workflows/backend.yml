@@ -3,13 +3,19 @@ name: Deploy backend
 on:
   push:
     branches: [main]
-    paths: ["backend/**", ".github/workflows/backend.yml"]
+    paths: ["backend/**", "scripts/**", ".github/workflows/backend.yml"]
   pull_request:
-    paths: ["backend/**", ".github/workflows/backend.yml"]
+    paths: ["backend/**", "scripts/**", ".github/workflows/backend.yml"]
   workflow_dispatch:
+    inputs:
+      action:
+        description: "Deploy with mandatory runtime checks, or verify the existing deployment only"
+        type: choice
+        options: [deploy, verify]
+        default: deploy
+        required: true
 
 permissions:
-  id-token: write
   contents: read
 
 env:
@@ -17,7 +23,6 @@ env:
   CONTAINER_APP: ca-agentharness-api
 
 jobs:
-  # Runs everywhere, no secrets required.
   test:
     runs-on: ubuntu-latest
     steps:
@@ -25,137 +30,81 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
       - name: Install
         working-directory: backend
-        run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[dev]"
-
+        run: python -m pip install -e ".[dev]" pyyaml
+      - name: Deployment helper regressions (no Azure access or Bicep compiler)
+        run: python -m pytest tests -q --ignore=tests/test_infra_registries.py
       - name: Lint
         working-directory: backend
         run: ruff check .
-
       - name: Test
         working-directory: backend
         env:
+          FOUNDRY_MODEL_ENDPOINT: https://example.openai.azure.com/openai/v1
           FOUNDRY_PROJECT_ENDPOINT: https://example.services.ai.azure.com/api/projects/test
           FOUNDRY_API_KEY: dummy
         run: pytest -q
-
       - name: Docker build
         working-directory: backend
         run: docker build -t agent-harness-api:ci .
 
   deploy:
     needs: test
-    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    if: github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write
+    concurrency:
+      group: agent-harness-azure-production
+      cancel-in-progress: false
+    env:
+      ACR_NAME: ${{ vars.ACR_NAME }}
+      AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      APP_ACCESS_TOKEN: ${{ secrets.APP_ACCESS_TOKEN }}
+      FOUNDRY_MODEL_ENDPOINT: ${{ vars.FOUNDRY_MODEL_ENDPOINT }}
+      FOUNDRY_PROJECT_ENDPOINT: ${{ vars.FOUNDRY_PROJECT_ENDPOINT }}
+      CORS_ORIGINS: ${{ vars.CORS_ORIGINS }}
+      MODEL_FAST: ${{ vars.MODEL_FAST }}
+      MODEL_CHAT: ${{ vars.MODEL_CHAT }}
+      MODEL_TOOLS: ${{ vars.MODEL_TOOLS }}
+      MODEL_THINK: ${{ vars.MODEL_THINK }}
+      MODEL_MAX: ${{ vars.MODEL_MAX }}
     steps:
       - uses: actions/checkout@v4
-
-      # Without this guard the job hard-fails on a fresh repo, which looks like
-      # a broken build rather than "infrastructure not provisioned yet".
-      - name: Check prerequisites
-        id: pre
+      - name: Require the production verification token
         run: |
-          missing=""
-          [ -z "${{ secrets.AZURE_CLIENT_ID }}" ] && missing="$missing AZURE_CLIENT_ID"
-          [ -z "${{ secrets.ACR_NAME }}" ] && missing="$missing ACR_NAME"
-
-          if [ -n "$missing" ]; then
-            echo "ready=false" >> "$GITHUB_OUTPUT"
-            {
-              echo "## Backend deploy skipped"
-              echo ""
-              echo "Missing secrets:\`$missing\`"
-              echo ""
-              echo "Run the **Deploy infrastructure** workflow first, then set the"
-              echo "secrets it prints. See \`docs/DEPLOY.md\`."
-            } >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "ready=true" >> "$GITHUB_OUTPUT"
-          fi
-
+          python - <<'PY'
+          import os
+          token = os.environ.get('APP_ACCESS_TOKEN', '')
+          if len(token) < 32 or any(c.isspace() for c in token):
+              raise SystemExit('Set APP_ACCESS_TOKEN to a strong random token of at least 32 characters')
+          PY
       - uses: azure/login@v2
-        if: steps.pre.outputs.ready == 'true'
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-
-      - name: Verify container app exists
-        if: steps.pre.outputs.ready == 'true'
-        run: |
-          if ! az containerapp show -n "$CONTAINER_APP" -g "$RESOURCE_GROUP" -o none 2>/dev/null; then
-            echo "::error::Container app '$CONTAINER_APP' not found in '$RESOURCE_GROUP'."
-            echo "::error::Run the 'Deploy infrastructure' workflow first."
-            exit 1
-          fi
-
+      - name: Check bootstrap exists
+        run: az containerapp show -n "$CONTAINER_APP" -g "$RESOURCE_GROUP" -o none
       - name: Build image in ACR
-        if: steps.pre.outputs.ready == 'true'
-        run: |
-          az acr build \
-            --registry "${{ secrets.ACR_NAME }}" \
-            --image "agent-harness-api:${{ github.sha }}" \
-            --image "agent-harness-api:latest" \
-            ./backend
-
-      - name: Update container app
-        if: steps.pre.outputs.ready == 'true'
-        run: |
-          az containerapp update \
-            --name "$CONTAINER_APP" \
-            --resource-group "$RESOURCE_GROUP" \
-            --image "${{ secrets.ACR_NAME }}.azurecr.io/agent-harness-api:${{ github.sha }}"
-
-      - name: Verify model routes
-        if: steps.pre.outputs.ready == 'true'
-        continue-on-error: true
+        if: inputs.action != 'verify'
         env:
-          FOUNDRY_PROJECT_ENDPOINT: ${{ secrets.FOUNDRY_PROJECT_ENDPOINT }}
+          IMAGE_TAG: ${{ github.sha }}
         run: |
-          # Non-blocking: confirms every MODEL_* deployment exists and that
-          # tool-flagged routes actually emit tool calls. A model that silently
-          # ignores tool schemas otherwise only shows up mid-conversation.
-          if [ -z "$FOUNDRY_PROJECT_ENDPOINT" ]; then
-            echo "FOUNDRY_PROJECT_ENDPOINT not set; skipping model verification."
-            exit 0
-          fi
-          pip install -q openai azure-identity tiktoken pydantic
-          cd backend
-          python scripts/verify_models.py --json > /tmp/models.json || true
-
-          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
-          import json
-          rows = json.load(open("/tmp/models.json"))
-          print("### Model route verification\n")
-          print("| Route | Deployment | Reachable | Tools | Notes |")
-          print("|---|---|---|---|---|")
-          for r in rows:
-              tools = {True: "ok", False: "BROKEN", None: "n/a"}[r["tools_work"]]
-              notes = "; ".join(r["errors"] + r["warnings"]) or "-"
-              ok = "yes" if r["reachable"] else "NO"
-              print(f"| {r['route']} | `{r['deployment']}` | {ok} | {tools} | {notes} |")
-          PY
-
-      - name: Smoke test
-        if: steps.pre.outputs.ready == 'true'
+          test -n "$ACR_NAME" || { echo 'Set the ACR_NAME repository variable after bootstrap'; exit 1; }
+          az acr build --registry "$ACR_NAME" --image "agent-harness-api:$IMAGE_TAG" ./backend -o none
+      - name: Bind system identity and deploy real image on port 8000
+        if: inputs.action != 'verify'
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          python scripts/deploy.py backend --resource-group "$RESOURCE_GROUP" \
+            --image "$ACR_NAME.azurecr.io/agent-harness-api:$IMAGE_TAG"
+      - name: Mandatory health, auth gate and runtime model verification
         run: |
           FQDN=$(az containerapp show -n "$CONTAINER_APP" -g "$RESOURCE_GROUP" \
             --query properties.configuration.ingress.fqdn -o tsv)
-
-          # min-replicas 0 means the first request pays a cold start.
-          for i in $(seq 1 12); do
-            code=$(curl -s -o /dev/null -w "%{http_code}" "https://$FQDN/health" || true)
-            if [ "$code" = "200" ]; then
-              echo "Healthy at https://$FQDN"
-              echo "- API healthy: https://$FQDN" >> "$GITHUB_STEP_SUMMARY"
-              exit 0
-            fi
-            echo "attempt $i -> $code (cold start?)"
-            sleep 10
-          done
-          echo "::error::Health check never returned 200"
-          exit 1
+          python scripts/verify_deployment.py --url "https://$FQDN" --model-timeout 180

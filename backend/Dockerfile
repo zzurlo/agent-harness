@@ -7,13 +7,11 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 
 COPY pyproject.toml ./
-RUN pip install --no-cache-dir \
-    "fastapi>=0.115" "uvicorn[standard]>=0.32" "openai>=1.54" \
-    "azure-identity>=1.19" "azure-data-tables>=12.5" "httpx>=0.27" \
-    "pydantic>=2.9" "tiktoken>=0.8"
-
 COPY harness ./harness
 COPY api ./api
+COPY scripts ./scripts
+# Keep the image and local/CI dependencies sourced from the same manifest.
+RUN pip install --no-cache-dir .
 
 EXPOSE 8000
 
