@@ -110,6 +110,36 @@ jobs:
             --resource-group "$RESOURCE_GROUP" \
             --image "${{ secrets.ACR_NAME }}.azurecr.io/agent-harness-api:${{ github.sha }}"
 
+      - name: Verify model routes
+        if: steps.pre.outputs.ready == 'true'
+        continue-on-error: true
+        env:
+          FOUNDRY_PROJECT_ENDPOINT: ${{ secrets.FOUNDRY_PROJECT_ENDPOINT }}
+        run: |
+          # Non-blocking: confirms every MODEL_* deployment exists and that
+          # tool-flagged routes actually emit tool calls. A model that silently
+          # ignores tool schemas otherwise only shows up mid-conversation.
+          if [ -z "$FOUNDRY_PROJECT_ENDPOINT" ]; then
+            echo "FOUNDRY_PROJECT_ENDPOINT not set; skipping model verification."
+            exit 0
+          fi
+          pip install -q openai azure-identity tiktoken pydantic
+          cd backend
+          python scripts/verify_models.py --json > /tmp/models.json || true
+
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          rows = json.load(open("/tmp/models.json"))
+          print("### Model route verification\n")
+          print("| Route | Deployment | Reachable | Tools | Notes |")
+          print("|---|---|---|---|---|")
+          for r in rows:
+              tools = {True: "ok", False: "BROKEN", None: "n/a"}[r["tools_work"]]
+              notes = "; ".join(r["errors"] + r["warnings"]) or "-"
+              ok = "yes" if r["reachable"] else "NO"
+              print(f"| {r['route']} | `{r['deployment']}` | {ok} | {tools} | {notes} |")
+          PY
+
       - name: Smoke test
         if: steps.pre.outputs.ready == 'true'
         run: |

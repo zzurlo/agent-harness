@@ -91,6 +91,45 @@ gh secret set FOUNDRY_PROJECT_ENDPOINT \
   --body "https://<resource>.services.ai.azure.com/api/projects/<project>"
 ```
 
+### Verify the deployments before you deploy the app
+
+```bash
+cd backend
+export FOUNDRY_PROJECT_ENDPOINT="https://<res>.services.ai.azure.com/api/projects/<proj>"
+python scripts/verify_models.py
+```
+
+```
+Foundry model verification
+endpoint: https://foundry-agentharness.services.ai.azure.com/api/projects/harness
+auth:     Entra ID (DefaultAzureCredential)
+
+  PASS  fast    Phi-4-mini-reasoning                  340ms
+  PASS  chat    Llama-3.3-70B-Instruct                810ms  tools ok
+  FAIL  tools   grok-4.1-fast-reasoning               520ms  tools broken
+        -> accepted the tool schema but emitted no tool call -- this model
+           will silently never use tools.
+  FAIL  think   DeepSeek-V4-Flash                         -
+        -> deployment not found -- check the name in Foundry portal
+
+2 of 4 routes unusable.
+```
+
+Each route gets two probes: a trivial completion, and — for routes flagged `supports_tools` — a tool-calling probe that can only be answered by emitting a call.
+
+The second probe is the one that matters. A model that **accepts your tool schema and then ignores it** produces no error anywhere; your agent loop just quietly never calls a tool, and you find out mid-conversation. This catches it before deploy.
+
+| Flag | Effect |
+|---|---|
+| `--route tools` | check one route (repeatable) |
+| `--json` | machine-readable output |
+| `--skip-tools` | completion probe only |
+| `--timeout 90` | per-request timeout |
+
+Exit codes: `0` all usable, `1` at least one hard failure, `2` config/credential problem.
+
+The backend deploy workflow runs this automatically after each deploy (non-blocking) and writes the results table to the job summary.
+
 ## 3. Provision infrastructure
 
 Actions → **Deploy infrastructure** → Run workflow. Or locally:

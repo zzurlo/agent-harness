@@ -93,7 +93,8 @@ backend/
       registry.py   decorator registration, schema gen, safe dispatch
       builtin.py    example tools
   api/main.py       FastAPI + SSE
-  tests/            21 tests, no network required
+  scripts/verify_models.py  pre-deploy route verification
+  tests/            34 tests, no network required
 frontend/           React + Vite
 infra/main.bicep    RG-scoped: ACA env, SWA, ACR, Storage, capped logs
 .github/workflows/  OIDC deploy for backend + frontend
@@ -118,8 +119,25 @@ npm run dev                   # http://localhost:5173
 Tests need no Foundry deployment:
 
 ```bash
-cd backend && pytest -q       # 21 passed
+cd backend && pytest -q       # 34 passed
 ```
+
+### Verify your model deployments
+
+Before deploying, confirm every route actually works:
+
+```bash
+cd backend
+export FOUNDRY_PROJECT_ENDPOINT="https://<res>.services.ai.azure.com/api/projects/<proj>"
+python scripts/verify_models.py
+```
+
+Probes each route for reachability, and — for tool-flagged routes — whether it
+actually emits a tool call. That second check is the important one: a model that
+accepts your tool schema and silently ignores it throws no error anywhere. Your
+agent loop just never calls a tool, and you find out mid-conversation.
+
+See [docs/DEPLOY.md](docs/DEPLOY.md) for flags and the full deploy runbook.
 
 ## Deploy
 
