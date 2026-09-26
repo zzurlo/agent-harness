@@ -9,8 +9,9 @@ from __future__ import annotations
 import asyncio
 
 from fastapi import APIRouter, HTTPException
-from harness.config import ROUTES, RouteName
 from pydantic import BaseModel, ConfigDict, Field
+
+from harness.config import ROUTES, RouteName
 from scripts.verify_models import RouteResult, verify_routes
 
 router = APIRouter(prefix="/admin", tags=["verification"])

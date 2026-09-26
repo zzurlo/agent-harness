@@ -1,8 +1,9 @@
 """Verify real app wiring, not a separately constructed test router."""
 from unittest.mock import AsyncMock
 
-from api.main import app
 from fastapi.testclient import TestClient
+
+from api.main import app
 from scripts.verify_models import RouteResult
 
 KEY = "integration-test-owner-key-0123456789abcdef"

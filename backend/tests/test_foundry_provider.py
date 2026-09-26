@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 from azure.core.credentials import AccessToken
+
 from harness.config import Settings
 from harness.providers import foundry
 

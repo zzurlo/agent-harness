@@ -14,6 +14,10 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
+
+from api.auth import OwnerAuthMiddleware
+from api.verification import router as verification_router
 from harness.config import settings
 from harness.context import Conversation
 from harness.loop import Harness, approvals, generate_title
@@ -22,10 +26,6 @@ from harness.providers import foundry
 from harness.router import route_table
 from harness.tools import builtin  # noqa: F401 - registers tools on import
 from harness.tools.registry import registry
-from pydantic import BaseModel, Field
-
-from api.auth import OwnerAuthMiddleware
-from api.verification import router as verification_router
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 log = logging.getLogger("api")

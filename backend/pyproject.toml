@@ -37,6 +37,10 @@ ignore = [
     "B008",  # FastAPI's Depends() in defaults is idiomatic
 ]
 
+[tool.ruff.lint.isort]
+# Stable classification whether Ruff runs at repo root or from backend/ in CI.
+known-first-party = ["api", "harness", "scripts"]
+
 [tool.ruff.lint.per-file-ignores]
 "harness/tools/__init__.py" = ["E402"]  # import-for-side-effect is deliberate
 "tests/*" = ["F401"]

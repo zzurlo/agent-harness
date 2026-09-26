@@ -1,7 +1,8 @@
 """Global gate integration tests: no provider/network calls required."""
 import pytest
-from api.main import app
 from fastapi.testclient import TestClient
+
+from api.main import app
 
 KEY = "private-owner-test-key-0123456789abcdef"
 

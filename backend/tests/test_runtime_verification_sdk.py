@@ -3,10 +3,11 @@ import asyncio
 from types import SimpleNamespace
 
 import httpx
-from api import verification
 from fastapi import FastAPI
-from harness.providers import foundry
 from openai import AsyncOpenAI
+
+from api import verification
+from harness.providers import foundry
 
 
 async def test_runtime_uses_cached_provider_client(monkeypatch):
