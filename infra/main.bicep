@@ -40,11 +40,23 @@ param containerImage string = 'mcr.microsoft.com/k8se/quickstart:latest'
 @description('True once a real image exists in ACR. Enables the ACR registry binding.')
 param useAcrImage bool = false
 
-@description('Foundry project endpoint, e.g. https://<res>.services.ai.azure.com/api/projects/<proj>')
-param foundryProjectEndpoint string = ''
+@description('Server-only bearer token. Required for a real image; scripts/deploy.py validates strength.')
+@secure()
+param appAccessToken string = ''
 
-@description('Allowed CORS origins (the SWA hostname).')
-param corsOrigins string = ''
+@description('Live environment, secrets and registries preserved by scripts/deploy.py. Never supply through CLI argv.')
+@secure()
+param runtimeConfig object
+
+// Use scripts/deploy.py, not raw defaults, for every routine infrastructure rerun.
+var defaultEnv = {
+  CORS_ORIGINS: { name: 'CORS_ORIGINS', value: 'https://${swa.properties.defaultHostname}' }
+  LOG_LEVEL: { name: 'LOG_LEVEL', value: 'INFO' }
+  TABLES_CONNECTION_STRING: { name: 'TABLES_CONNECTION_STRING', secretRef: 'tables-connection' }
+}
+var runtimeEnv = union(defaultEnv, toObject(runtimeConfig.env, entry => entry.name, entry => entry), useAcrImage ? {
+  APP_ACCESS_TOKEN: { name: 'APP_ACCESS_TOKEN', secretRef: 'app-access-token' }
+} : {})
 
 var uniq = uniqueString(resourceGroup().id)
 
@@ -111,31 +123,26 @@ resource api 'Microsoft.App/containerApps@2024-03-01' = {
   properties: {
     managedEnvironmentId: env.id
     configuration: {
+      activeRevisionsMode: 'Single'
       ingress: {
         external: true
-        targetPort: 8000
+        targetPort: useAcrImage ? 8000 : 80
         transport: 'auto'
         allowInsecure: false
-        corsPolicy: {
-          allowedOrigins: empty(corsOrigins) ? ['*'] : split(corsOrigins, ',')
-          allowedMethods: ['GET', 'POST', 'DELETE', 'OPTIONS']
-          allowedHeaders: ['*']
-        }
       }
-      // On first deploy this is empty: binding ACR before the AcrPull role
-      // exists makes the app fail to start.
-      registries: useAcrImage ? [
+      // Bootstrap identity must exist before AcrPull can be assigned.
+      registries: union(runtimeConfig.registries, useAcrImage ? [
         {
           server: acr.properties.loginServer
           identity: 'system'
         }
-      ] : []
-      secrets: [
+      ] : [])
+      secrets: concat(runtimeConfig.secrets, [
         {
           name: 'tables-connection'
           value: 'DefaultEndpointsProtocol=https;AccountName=${storage.name};AccountKey=${storage.listKeys().keys[0].value};EndpointSuffix=${environment().suffixes.storage}'
         }
-      ]
+      ], useAcrImage ? [{ name: 'app-access-token', value: appAccessToken }] : [])
     }
     template: {
       containers: [
@@ -146,16 +153,11 @@ resource api 'Microsoft.App/containerApps@2024-03-01' = {
             cpu: json('0.5')
             memory: '1Gi'
           }
-          env: [
-            { name: 'FOUNDRY_PROJECT_ENDPOINT', value: foundryProjectEndpoint }
-            { name: 'CORS_ORIGINS', value: corsOrigins }
-            { name: 'TABLES_CONNECTION_STRING', secretRef: 'tables-connection' }
-            { name: 'LOG_LEVEL', value: 'INFO' }
-          ]
+          env: map(items(runtimeEnv), entry => entry.value)
           probes: [
             {
               type: 'Readiness'
-              httpGet: { path: '/health', port: 8000 }
+              httpGet: { path: useAcrImage ? '/health' : '/', port: useAcrImage ? 8000 : 80 }
               initialDelaySeconds: 3
               periodSeconds: 5
             }
@@ -165,7 +167,7 @@ resource api 'Microsoft.App/containerApps@2024-03-01' = {
       scale: {
         // THE cost lever: zero replicas when idle.
         minReplicas: 0
-        maxReplicas: 2
+        maxReplicas: 1
         rules: [
           {
             name: 'http-concurrency'

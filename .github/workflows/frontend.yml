@@ -5,18 +5,14 @@ on:
     branches: [main]
     paths: ["frontend/**", ".github/workflows/frontend.yml"]
   pull_request:
-    types: [opened, synchronize, reopened, closed]
     paths: ["frontend/**", ".github/workflows/frontend.yml"]
   workflow_dispatch:
 
 permissions:
   contents: read
-  pull-requests: write
 
 jobs:
-  # Always runs -- proves the app compiles even with no Azure secrets.
   build:
-    if: github.event.action != 'closed'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -25,19 +21,18 @@ jobs:
           node-version: "20"
           cache: npm
           cache-dependency-path: frontend/package-lock.json
-
       - name: Install
         working-directory: frontend
         run: npm ci
-
-      - name: Build
+      - name: Test
+        working-directory: frontend
+        run: npm test
+      - name: Build with public API origin only (never an access token)
         working-directory: frontend
         env:
-          VITE_API_BASE: ${{ secrets.VITE_API_BASE }}
+          VITE_API_BASE: ${{ vars.VITE_API_BASE }}
         run: npm run build
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: frontend-dist
           path: frontend/dist
@@ -45,71 +40,36 @@ jobs:
 
   deploy:
     needs: build
-    if: github.event.action != 'closed'
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
     runs-on: ubuntu-latest
+    concurrency:
+      group: agent-harness-swa-production
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
-
-      - name: Check for deployment token
-        id: pre
+      - name: Require production configuration
+        env:
+          SWA_TOKEN: ${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN }}
+          VITE_API_BASE: ${{ vars.VITE_API_BASE }}
         run: |
-          if [ -n "${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN }}" ]; then
-            echo "ready=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "ready=false" >> "$GITHUB_OUTPUT"
-            {
-              echo "## Frontend deploy skipped"
-              echo ""
-              echo "\`AZURE_STATIC_WEB_APPS_API_TOKEN\` is not set."
-              echo "The build succeeded and the artifact was uploaded."
-              echo ""
-              echo "Provision infra, then:"
-              echo ""
-              echo '\`\`\`bash'
-              echo "az staticwebapp secrets list -n swa-agentharness \\"
-              echo "  -g rg-agent-harness --query properties.apiKey -o tsv"
-              echo '\`\`\`'
-            } >> "$GITHUB_STEP_SUMMARY"
-          fi
-
+          test -n "$SWA_TOKEN" || { echo 'Set AZURE_STATIC_WEB_APPS_API_TOKEN after bootstrap'; exit 1; }
+          python - <<'PY'
+          import os
+          from urllib.parse import urlsplit
+          url = urlsplit(os.environ.get('VITE_API_BASE', ''))
+          if (url.scheme != 'https' or not url.hostname or url.username or url.password
+              or url.query or url.fragment or url.path not in ('', '/')):
+              raise SystemExit('VITE_API_BASE must be a public HTTPS API origin only')
+          PY
       - uses: actions/download-artifact@v4
-        if: steps.pre.outputs.ready == 'true'
         with:
           name: frontend-dist
           path: frontend/dist
-
-      - name: Deploy to Static Web Apps
-        if: steps.pre.outputs.ready == 'true'
+      - name: Deploy prebuilt dist to Static Web Apps
         uses: Azure/static-web-apps-deploy@v1
         with:
           azure_static_web_apps_api_token: ${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN }}
-          repo_token: ${{ secrets.GITHUB_TOKEN }}
           action: upload
-          app_location: "frontend"
-          output_location: "dist"
+          app_location: "frontend/dist"
+          output_location: ""
           skip_app_build: true
-          skip_deploy_on_missing_secrets: true
-
-  close_pr:
-    if: github.event.action == 'closed'
-    runs-on: ubuntu-latest
-    steps:
-      # The `secrets` context is not available in `if:` expressions, so the
-      # guard has to be a normal step that writes an output.
-      - name: Check for deployment token
-        id: pre
-        run: |
-          if [ -n "${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN }}" ]; then
-            echo "ready=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "ready=false" >> "$GITHUB_OUTPUT"
-            echo "No SWA token configured; nothing to close." >> "$GITHUB_STEP_SUMMARY"
-          fi
-
-      - name: Close staging environment
-        if: steps.pre.outputs.ready == 'true'
-        uses: Azure/static-web-apps-deploy@v1
-        with:
-          azure_static_web_apps_api_token: ${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN }}
-          action: close
-          skip_deploy_on_missing_secrets: true
