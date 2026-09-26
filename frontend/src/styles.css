@@ -60,6 +60,14 @@ main {
   gap: 14px;
 }
 
+.unlock { margin: auto; width: 100%; max-width: 420px; display: flex; flex-direction: column; gap: 12px; }
+.unlock h2 { margin-bottom: 0; }
+.unlock p { color: var(--muted); font-size: 13px; line-height: 1.6; }
+.unlock label { font-size: 13px; }
+.unlock input { background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 12px; font: inherit; }
+.unlock input:focus { outline: 2px solid var(--accent); }
+.unlock .auth-error { color: var(--fail); }
+
 .empty { margin: auto; text-align: center; color: var(--muted); }
 .empty h2 { color: var(--text); font-size: 22px; margin-bottom: 6px; }
 .empty p { font-size: 13px; max-width: 380px; line-height: 1.6; }

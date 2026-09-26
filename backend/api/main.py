@@ -16,6 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+from api.auth import OwnerAuthMiddleware
 from harness.config import settings
 from harness.context import Conversation
 from harness.loop import Harness, approvals, generate_title
@@ -41,8 +42,6 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="agent-harness", version="0.1.0", lifespan=lifespan)
 
 # Last registered is outermost: CORS validates preflights and decorates 401/503.
-from api.auth import OwnerAuthMiddleware
-
 app.add_middleware(OwnerAuthMiddleware)
 app.add_middleware(
     CORSMiddleware,

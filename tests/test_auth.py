@@ -1,7 +1,7 @@
 """Global gate integration tests: no provider/network calls required."""
 import pytest
-from fastapi.testclient import TestClient
 from api.main import app
+from fastapi.testclient import TestClient
 
 KEY = "private-owner-test-key-0123456789abcdef"
 
@@ -62,7 +62,7 @@ def test_unauthorized_never_calls_business_handler(client, monkeypatch):
 
 
 def test_malformed_unicode_and_duplicate_headers(client):
-    for raw in [b"Bearer \xff\xfe", "Bearer 😀".encode("utf-8")]:
+    for raw in [b"Bearer \xff\xfe", "Bearer 😀".encode()]:
         assert client.get("/routes", headers=[(b"authorization", raw)]).status_code == 401
     assert client.get("/routes", headers=[("authorization", "Bearer " + KEY),
         ("authorization", "Bearer wrong")]).status_code == 401
@@ -83,3 +83,35 @@ def test_cors_preflight(client):
     response = client.get("/routes", headers={"Origin": origin})
     assert response.status_code == 401
     assert "access-control-allow-origin" in response.headers
+
+
+def test_exact_minimum_key_length(client, monkeypatch):
+    monkeypatch.setenv("APP_ACCESS_TOKEN", "a" * 32)
+    assert client.get("/routes", headers={"Authorization": "Bearer " + "a" * 32}).status_code == 200
+
+
+def test_guard_does_not_buffer_sse(monkeypatch):
+    import asyncio
+
+    from api.auth import OwnerAuthMiddleware
+
+    monkeypatch.setenv("APP_ACCESS_TOKEN", KEY)
+    sent = []
+
+    async def send(message):
+        sent.append(message)
+
+    async def receive():
+        pytest.fail("auth middleware must not consume the request body")
+
+    async def streaming_app(scope, receive, send):
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"data: first\n\n", "more_body": True})
+        # Must already have reached the transport before the next chunk exists.
+        assert sent[-1]["body"] == b"data: first\n\n"
+        await send({"type": "http.response.body", "body": b"data: last\n\n", "more_body": False})
+
+    scope = {"type": "http", "method": "POST", "path": "/chat",
+             "headers": [(b"authorization", ("Bearer " + KEY).encode())]}
+    asyncio.run(OwnerAuthMiddleware(streaming_app)(scope, receive, send))
+    assert len(sent) == 3

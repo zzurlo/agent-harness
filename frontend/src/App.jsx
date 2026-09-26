@@ -3,7 +3,8 @@ import ChatMessage from "./components/ChatMessage";
 import Composer from "./components/Composer";
 import StatsBar from "./components/StatsBar";
 import ApprovalDialog from "./components/ApprovalDialog";
-import { streamChat, warmup } from "./lib/api";
+import { getGeneration, logout, streamChat, subscribeAuth, warmup } from "./lib/api";
+import UnlockForm from "./components/UnlockForm";
 
 export default function App() {
   const [messages, setMessages] = useState([]);
@@ -14,6 +15,27 @@ export default function App() {
   const [approval, setApproval] = useState(null);
   const [warm, setWarm] = useState(false);
   const bottomRef = useRef(null);
+  const [unlocked, setUnlocked] = useState(false);
+  const [authError, setAuthError] = useState("");
+  const mounted = useRef(true);
+  const renderGeneration = getGeneration();
+
+  useEffect(() => {
+    mounted.current = true;
+    const unsubscribe = subscribeAuth((open, reason) => {
+      setUnlocked(open);
+      setAuthError(reason);
+      if (!open) {
+        setMessages([]);
+        setThreadId(null);
+        setStats(null);
+        setRoute(null);
+        setApproval(null);
+        setBusy(false);
+      }
+    });
+    return () => { mounted.current = false; unsubscribe(); logout(); };
+  }, []);
 
   // The backend runs at min-replicas 0 to cost ~$0 when idle, which means a
   // 3-10s cold start. Firing warmup on page load hides it behind the time the
@@ -29,7 +51,9 @@ export default function App() {
   }, [messages]);
 
   async function send(text) {
-    if (!text.trim() || busy) return;
+    if (!unlocked || !text.trim() || busy) return;
+    const epoch = getGeneration();
+    const current = () => mounted.current && epoch === getGeneration();
     setBusy(true);
     setStats(null);
     setMessages((m) => [
@@ -40,6 +64,7 @@ export default function App() {
 
     try {
       await streamChat({ message: text, threadId }, (evt) => {
+        if (!current()) return;
         switch (evt.type) {
           case "thread":
             setThreadId(evt.thread_id);
@@ -104,13 +129,15 @@ export default function App() {
         }
       });
     } catch (err) {
-      setMessages((m) => [
+      if (current() && err.name !== "AbortError") setMessages((m) => [
         ...m,
         { role: "system", content: `Request failed: ${err.message}`, error: true },
       ]);
     } finally {
-      setBusy(false);
-      setMessages((m) => m.filter((msg) => !(msg.pending && !msg.content)));
+      if (current()) {
+        setBusy(false);
+        setMessages((m) => m.filter((msg) => !(msg.pending && !msg.content)));
+      }
     }
   }
 
@@ -119,11 +146,13 @@ export default function App() {
       <header>
         <h1>agent-harness</h1>
         <div className="header-right">
+          {unlocked && <button className="ghost" onClick={() => logout()}>Logout</button>}
           {route && <span className="route-chip">{route.route} · {route.deployment}</span>}
           <span className={`warm-dot ${warm ? "on" : "off"}`} title={warm ? "Backend warm" : "Cold start likely"} />
         </div>
       </header>
 
+      {!unlocked ? <main><UnlockForm reason={authError} /></main> : <>
       <main>
         {messages.length === 0 && (
           <div className="empty">
@@ -146,9 +175,12 @@ export default function App() {
       {approval && (
         <ApprovalDialog
           approval={approval}
-          onResolve={() => setApproval(null)}
+          onResolve={() => {
+            if (mounted.current && renderGeneration === getGeneration()) setApproval(null);
+          }}
         />
       )}
+      </>}
     </div>
   );
 }
