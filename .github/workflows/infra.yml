@@ -1,0 +1,200 @@
+name: Deploy infrastructure
+
+# Provisions the Azure resources that the backend/frontend workflows deploy
+# INTO. Run this first -- it is the chicken-and-egg step.
+#
+# Order of operations for a brand-new environment:
+#   1. Set secrets: AZURE_CLIENT_ID / AZURE_TENANT_ID / AZURE_SUBSCRIPTION_ID
+#   2. Run this workflow (workflow_dispatch) with your Foundry endpoint
+#   3. Copy the outputs it prints into the remaining repo secrets
+#   4. Push to main -- backend + frontend workflows then have somewhere to go
+
+on:
+  push:
+    branches: [main]
+    paths: ["infra/**", ".github/workflows/infra.yml"]
+  pull_request:
+    paths: ["infra/**", ".github/workflows/infra.yml"]
+  workflow_dispatch:
+    inputs:
+      foundry_endpoint:
+        description: "Foundry project endpoint (https://<res>.services.ai.azure.com/api/projects/<proj>)"
+        required: false
+        default: ""
+      location:
+        description: "Azure region (must support the Responses API)"
+        required: false
+        default: "centralus"
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+env:
+  RESOURCE_GROUP: rg-agent-harness
+
+jobs:
+  # Always runs, including on forks and without secrets. Catches syntax and
+  # type errors in the template before anyone tries to deploy it.
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build bicep (syntax + type check)
+        run: |
+          az bicep install
+          az bicep build --file infra/main.bicep --outfile /tmp/main.json
+          echo "Template compiled successfully."
+
+      - name: Lint bicep
+        run: az bicep lint --file infra/main.bicep
+
+      - name: Summarize resources
+        run: |
+          echo "### Resources in main.bicep" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          with open("/tmp/main.json") as fh:
+              tpl = json.load(fh)
+          for r in tpl.get("resources", []):
+              print(f"{r.get('type')}  ->  {r.get('name')}")
+          PY
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+  # What-if on PRs: shows the diff against live Azure without changing anything.
+  preview:
+    needs: validate
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for Azure credentials
+        id: creds
+        run: |
+          if [ -n "${{ secrets.AZURE_CLIENT_ID }}" ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "Azure credentials not configured -- skipping what-if." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - uses: azure/login@v2
+        if: steps.creds.outputs.available == 'true'
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: What-if
+        if: steps.creds.outputs.available == 'true'
+        run: |
+          az group create -n "$RESOURCE_GROUP" -l centralus -o none
+          az deployment group what-if \
+            -g "$RESOURCE_GROUP" \
+            -f infra/main.bicep \
+            -p foundryProjectEndpoint="${{ secrets.FOUNDRY_PROJECT_ENDPOINT }}" \
+            || true
+
+  deploy:
+    needs: validate
+    if: github.event_name == 'workflow_dispatch' || (github.ref == 'refs/heads/main' && github.event_name == 'push')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for Azure credentials
+        id: creds
+        run: |
+          if [ -n "${{ secrets.AZURE_CLIENT_ID }}" ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            {
+              echo "## Infrastructure deploy skipped"
+              echo ""
+              echo "\`AZURE_CLIENT_ID\` is not set. Configure OIDC first:"
+              echo ""
+              echo '```bash'
+              echo "az ad app create --display-name agent-harness-ci"
+              echo '```'
+              echo ""
+              echo "See \`docs/DEPLOY.md\` for the full walkthrough."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - uses: azure/login@v2
+        if: steps.creds.outputs.available == 'true'
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Create resource group
+        if: steps.creds.outputs.available == 'true'
+        run: |
+          LOC="${{ inputs.location }}"
+          az group create -n "$RESOURCE_GROUP" -l "${LOC:-centralus}" -o none
+
+      - name: Deploy bicep
+        if: steps.creds.outputs.available == 'true'
+        id: deploy
+        run: |
+          ENDPOINT="${{ inputs.foundry_endpoint }}"
+          if [ -z "$ENDPOINT" ]; then
+            ENDPOINT="${{ secrets.FOUNDRY_PROJECT_ENDPOINT }}"
+          fi
+
+          az deployment group create \
+            -g "$RESOURCE_GROUP" \
+            -n "harness-$(date +%Y%m%d%H%M%S)" \
+            -f infra/main.bicep \
+            -p foundryProjectEndpoint="$ENDPOINT" \
+            -o json > /tmp/out.json
+
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os
+          with open("/tmp/out.json") as fh:
+              outputs = json.load(fh)["properties"]["outputs"]
+          for key, val in outputs.items():
+              print(f"{key}={val['value']}")
+          PY
+
+      - name: Print next steps
+        if: steps.creds.outputs.available == 'true'
+        run: |
+          {
+            echo "## Infrastructure deployed"
+            echo ""
+            echo "| Output | Value |"
+            echo "|---|---|"
+            echo "| API URL | ${{ steps.deploy.outputs.apiUrl }} |"
+            echo "| ACR | ${{ steps.deploy.outputs.acrLoginServer }} |"
+            echo "| SWA hostname | ${{ steps.deploy.outputs.swaHostname }} |"
+            echo "| API principal ID | ${{ steps.deploy.outputs.apiPrincipalId }} |"
+            echo ""
+            echo "### Set these repo secrets"
+            echo ""
+            echo '```'
+            echo "ACR_NAME=$(echo '${{ steps.deploy.outputs.acrLoginServer }}' | cut -d. -f1)"
+            echo "VITE_API_BASE=${{ steps.deploy.outputs.apiUrl }}"
+            echo '```'
+            echo ""
+            echo "### Grant the API access to Foundry"
+            echo ""
+            echo '```bash'
+            echo "az role assignment create \\"
+            echo "  --assignee ${{ steps.deploy.outputs.apiPrincipalId }} \\"
+            echo "  --role 'Foundry User' \\"
+            echo "  --scope <your-foundry-project-resource-id>"
+            echo '```'
+            echo ""
+            echo "Then get the SWA deployment token for AZURE_STATIC_WEB_APPS_API_TOKEN:"
+            echo ""
+            echo '```bash'
+            echo "az staticwebapp secrets list -n swa-agentharness -g $RESOURCE_GROUP --query properties.apiKey -o tsv"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

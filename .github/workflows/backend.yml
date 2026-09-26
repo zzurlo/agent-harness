@@ -1,0 +1,131 @@
+name: Deploy backend
+
+on:
+  push:
+    branches: [main]
+    paths: ["backend/**", ".github/workflows/backend.yml"]
+  pull_request:
+    paths: ["backend/**", ".github/workflows/backend.yml"]
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  RESOURCE_GROUP: rg-agent-harness
+  CONTAINER_APP: ca-agentharness-api
+
+jobs:
+  # Runs everywhere, no secrets required.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        working-directory: backend
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Lint
+        working-directory: backend
+        run: ruff check .
+
+      - name: Test
+        working-directory: backend
+        env:
+          FOUNDRY_PROJECT_ENDPOINT: https://example.services.ai.azure.com/api/projects/test
+          FOUNDRY_API_KEY: dummy
+        run: pytest -q
+
+      - name: Docker build
+        working-directory: backend
+        run: docker build -t agent-harness-api:ci .
+
+  deploy:
+    needs: test
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Without this guard the job hard-fails on a fresh repo, which looks like
+      # a broken build rather than "infrastructure not provisioned yet".
+      - name: Check prerequisites
+        id: pre
+        run: |
+          missing=""
+          [ -z "${{ secrets.AZURE_CLIENT_ID }}" ] && missing="$missing AZURE_CLIENT_ID"
+          [ -z "${{ secrets.ACR_NAME }}" ] && missing="$missing ACR_NAME"
+
+          if [ -n "$missing" ]; then
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            {
+              echo "## Backend deploy skipped"
+              echo ""
+              echo "Missing secrets:\`$missing\`"
+              echo ""
+              echo "Run the **Deploy infrastructure** workflow first, then set the"
+              echo "secrets it prints. See \`docs/DEPLOY.md\`."
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: azure/login@v2
+        if: steps.pre.outputs.ready == 'true'
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Verify container app exists
+        if: steps.pre.outputs.ready == 'true'
+        run: |
+          if ! az containerapp show -n "$CONTAINER_APP" -g "$RESOURCE_GROUP" -o none 2>/dev/null; then
+            echo "::error::Container app '$CONTAINER_APP' not found in '$RESOURCE_GROUP'."
+            echo "::error::Run the 'Deploy infrastructure' workflow first."
+            exit 1
+          fi
+
+      - name: Build image in ACR
+        if: steps.pre.outputs.ready == 'true'
+        run: |
+          az acr build \
+            --registry "${{ secrets.ACR_NAME }}" \
+            --image "agent-harness-api:${{ github.sha }}" \
+            --image "agent-harness-api:latest" \
+            ./backend
+
+      - name: Update container app
+        if: steps.pre.outputs.ready == 'true'
+        run: |
+          az containerapp update \
+            --name "$CONTAINER_APP" \
+            --resource-group "$RESOURCE_GROUP" \
+            --image "${{ secrets.ACR_NAME }}.azurecr.io/agent-harness-api:${{ github.sha }}"
+
+      - name: Smoke test
+        if: steps.pre.outputs.ready == 'true'
+        run: |
+          FQDN=$(az containerapp show -n "$CONTAINER_APP" -g "$RESOURCE_GROUP" \
+            --query properties.configuration.ingress.fqdn -o tsv)
+
+          # min-replicas 0 means the first request pays a cold start.
+          for i in $(seq 1 12); do
+            code=$(curl -s -o /dev/null -w "%{http_code}" "https://$FQDN/health" || true)
+            if [ "$code" = "200" ]; then
+              echo "Healthy at https://$FQDN"
+              echo "- API healthy: https://$FQDN" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            echo "attempt $i -> $code (cold start?)"
+            sleep 10
+          done
+          echo "::error::Health check never returned 200"
+          exit 1
