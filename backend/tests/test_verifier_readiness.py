@@ -64,6 +64,16 @@ def test_cli_configuration_json_without_network(env):
     assert "Traceback" not in process.stderr
 
 
+@pytest.mark.parametrize("args", [["--route", "unknown"], ["--timeout", "oops"],
+                                  ["--timeout", "nan"], ["--total-timeout", "0"]])
+def test_invalid_cli_options_emit_json(args):
+    process = subprocess.run([sys.executable, "scripts/verify_models.py", "--json", *args],
+        cwd=Path(__file__).parents[1], capture_output=True, text=True, timeout=10)
+    assert process.returncode == 2
+    assert json.loads(process.stdout)[0]["errors"]
+    assert "Traceback" not in process.stderr
+
+
 async def test_sdk_rate_limit_is_not_retried(monkeypatch):
     requests = []
     def respond(request):

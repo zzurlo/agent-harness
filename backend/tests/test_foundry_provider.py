@@ -1,11 +1,9 @@
 """Offline provider regression tests, including real SDK authentication."""
-from dataclasses import replace
 from types import SimpleNamespace
 
 import httpx
 import pytest
 from azure.core.credentials import AccessToken
-
 from harness.config import Settings
 from harness.providers import foundry
 
@@ -89,6 +87,13 @@ async def test_real_sdk_refreshes_bearer_and_closes_resources(monkeypatch):
     assert transport_client.is_closed
     assert foundry.get_client.cache_info().currsize == 0
     await foundry.close_client()  # idempotent, no new client/credential
+
+
+async def test_async_azure_transport_can_open_without_network():
+    from azure.core.pipeline.transport import AioHttpTransport
+
+    async with AioHttpTransport() as transport:
+        assert transport.session is not None
 
 
 async def test_api_key_does_not_create_credential(monkeypatch):

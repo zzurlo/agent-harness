@@ -5,14 +5,15 @@ Only this helper should deploy main.bicep. Direct deployment with its bootstrap
 parameters would replace a live application. No secret values belong in argv.
 """
 import argparse
-from contextlib import contextmanager
-from copy import deepcopy
 import json
 import os
-from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import time
+from contextlib import contextmanager
+from copy import deepcopy
+from pathlib import Path
 from urllib.parse import urlsplit
 
 PLACEHOLDER = "mcr.microsoft.com/k8se/quickstart:latest"
@@ -34,7 +35,7 @@ def private_json(value):
 
 def azure(args):
     result = subprocess.run(["az", *args, "--only-show-errors", "-o", "json"],
-                            capture_output=True, text=True, timeout=1800)
+                            capture_output=True, text=True, timeout=1800, check=False)
     if result.returncode:
         # Azure errors may include request bodies. Never relay stderr/stdout.
         raise RuntimeError("Azure operation failed; inspect the Azure activity log (output withheld)")
@@ -44,7 +45,11 @@ def azure(args):
 def parameters(live, secrets, overrides, location, image=None):
     props = live["properties"] if live else {}
     containers = props.get("template", {}).get("containers", [])
-    if containers and (len(containers) != 1 or containers[0]["name"] != "api"):
+    if live and live.get("location", "").lower() != location.lower():
+        raise ValueError("Location differs from the live app; use its existing region")
+    if not image and props.get("latestRevisionName") != props.get("latestReadyRevisionName"):
+        raise ValueError("Latest revision is not the serving ready revision; resolve the pending/failed rollout first")
+    if live and (len(containers) != 1 or containers[0]["name"] != "api"):
         raise ValueError("Expected exactly one api container; refusing to discard other containers")
     current = containers[0] if containers else {}
     image = image or current.get("image", PLACEHOLDER)
@@ -72,9 +77,12 @@ def parameters(live, secrets, overrides, location, image=None):
     cors = values.get("CORS_ORIGINS", {}).get("value", "")
     if "*" in cors:
         raise ValueError("CORS_ORIGINS must contain explicit origins, not wildcards")
+    if not cors:
+        values.pop("CORS_ORIGINS", None)  # Bicep derives the explicit SWA origin.
     values.pop("APP_ACCESS_TOKEN", None)
-    values.pop("TABLES_CONNECTION_STRING", None)
+
     return {"location": location, "containerImage": image, "useAcrImage": real,
+            "revisionSuffix": props.get("template", {}).get("revisionSuffix", ""),
             "runtimeEnv": list(values.values()), "appAccessToken": token,
             "additionalSecrets": [deepcopy(s) for s in secrets
                                   if s["name"] not in ("tables-connection", "app-access-token")],
@@ -99,6 +107,13 @@ def deploy_backend(group, app, image, overrides, az=azure):
     live = az(["containerapp", "show", "-g", group, "-n", app])
     secrets = read_secrets(group, app, az)
     p = parameters(live, secrets, overrides, live["location"], image)
+    if not any(e["name"] == "CORS_ORIGINS" for e in p["runtimeEnv"]):
+        hostname = az(["staticwebapp", "show", "-g", group,
+                       "-n", "swa-" + app.removeprefix("ca-").removesuffix("-api"),
+                       "--query", "defaultHostname"])
+        if not isinstance(hostname, str) or not hostname.endswith(".azurestaticapps.net"):
+            raise ValueError("Cannot derive SWA origin; set CORS_ORIGINS explicitly")
+        p["runtimeEnv"].append({"name": "CORS_ORIGINS", "value": "https://" + hostname})
     server = image.split("/")[0]
     if not server.endswith(".azurecr.io"):
         raise ValueError("The production image must be hosted in ACR")
@@ -109,8 +124,9 @@ def deploy_backend(group, app, image, overrides, az=azure):
         "--server", server, "--identity", "system"])
     template = deepcopy(live["properties"]["template"])
     container = template["containers"][0]
-    env = p["runtimeEnv"] + [{"name": "APP_ACCESS_TOKEN", "secretRef": "app-access-token"},
-                              {"name": "TABLES_CONNECTION_STRING", "secretRef": "tables-connection"}]
+    env = p["runtimeEnv"] + [{"name": "APP_ACCESS_TOKEN", "secretRef": "app-access-token"}]
+    if not any(e["name"] == "TABLES_CONNECTION_STRING" for e in env):
+        env.append({"name": "TABLES_CONNECTION_STRING", "secretRef": "tables-connection"})
     container.update(image=image, env=env, probes=[{
         "type": "Readiness", "httpGet": {"path": "/health", "port": 8000},
         "initialDelaySeconds": 3, "periodSeconds": 5}])
@@ -123,9 +139,10 @@ def deploy_backend(group, app, image, overrides, az=azure):
     ingress.update(targetPort=8000, external=True, allowInsecure=False)
     kept = [s for s in secrets if s["name"] != "app-access-token"]
     kept.append({"name": "app-access-token", "value": p["appAccessToken"]})
-    payload = {"properties": {"template": template, "configuration": {
-        "activeRevisionsMode": "Single", "ingress": ingress,
-        "registries": registries, "secrets": kept}}}
+    configuration = deepcopy(live["properties"]["configuration"])
+    configuration.update(activeRevisionsMode="Single", ingress=ingress,
+                         registries=registries, secrets=kept)
+    payload = {"properties": {"template": template, "configuration": configuration}}
     with private_json(payload) as filename:
         az(["rest", "--method", "patch", "--url", f"{app_url(group, app)}?api-version={API_VERSION}",
             "--body", "@" + filename])
@@ -141,6 +158,35 @@ def deploy_backend(group, app, image, overrides, az=azure):
     raise RuntimeError("New revision did not become ready within 600 seconds")
 
 
+def verify_infra(group, app, params, az):
+    # Do not accidentally verify the old serving revision during a rollout.
+    expected = f"{app}--{params['revisionSuffix']}"
+    deadline = time.monotonic() + 600
+    while time.monotonic() < deadline:
+        state = az(["containerapp", "show", "-g", group, "-n", app])["properties"]
+        if state.get("provisioningState") == "Failed":
+            raise RuntimeError("Container App revision provisioning failed")
+        if state.get("latestReadyRevisionName") == expected:
+            break
+        time.sleep(5)
+    else:
+        raise RuntimeError("New revision did not become ready within 600 seconds")
+    url = "https://" + state["configuration"]["ingress"]["fqdn"]
+    # Use precisely the token submitted to ARM, including a preserved live token
+    # when the GitHub secret is unset. Never place secrets in argv or logs.
+    env = {**os.environ, "APP_ACCESS_TOKEN": params["appAccessToken"]}
+    try:
+        result = subprocess.run(
+            [sys.executable, str(Path(__file__).with_name("verify_deployment.py")),
+             "--url", url, "--model-timeout", "180"],
+            env=env, capture_output=True, text=True, timeout=600, check=False)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("Infrastructure runtime verification timed out") from None
+    if result.returncode:
+        raise RuntimeError("Infrastructure runtime verification failed; deployment is NOT verified ready")
+    print("Verified infrastructure health, auth gate, and all configured runtime model routes.")
+
+
 def deploy_infra(group, name, location, action, overrides, az=azure):
     # List, rather than catch show errors: authorization/network failures must
     # never be interpreted as permission to restore the bootstrap image.
@@ -152,6 +198,8 @@ def deploy_infra(group, name, location, action, overrides, az=azure):
     secrets = read_secrets(group, app, az) if live else []
     p = parameters(live, secrets, overrides, location)
     p["name"] = name
+    if action == "deploy" and p["useAcrImage"]:
+        p["revisionSuffix"] = f"infra-{time.time_ns()}"
     if not exists:
         if action == "what-if":
             raise ValueError("Resource group absent: what-if does not create it; explicitly choose deploy to bootstrap")
@@ -163,6 +211,8 @@ def deploy_infra(group, name, location, action, overrides, az=azure):
         if action == "what-if":
             args += ["--no-pretty-print", "--result-format", "ResourceIdOnly"]
         result = az(args)
+    if action == "deploy" and p["useAcrImage"]:
+        verify_infra(group, app, p, az)
     if action == "what-if":
         for change in result.get("changes", []):
             print(change.get("changeType"), change.get("resourceId"))

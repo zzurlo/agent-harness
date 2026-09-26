@@ -50,6 +50,19 @@ def test_frontend_only_deploys_main_prebuilt_dist_with_public_url():
     assert "APP_ACCESS_TOKEN" not in str(w)
 
 
+def test_app_deployments_require_explicit_dispatch_during_bootstrap():
+    for name in ("backend", "frontend"):
+        condition = workflow(name)["jobs"]["deploy"]["if"]
+        assert "github.event_name == 'workflow_dispatch'" in condition
+
+
+def test_storage_account_name_respects_azure_length_limit():
+    text = (ROOT / "infra/main.bicep").read_text()
+    # Prefix is bounded but keeps the entire resource-group hash for uniqueness.
+    assert "name: 'st${take(name, 9)}${uniq}'" in text
+    assert len("st" + "agentharness"[:9] + "x" * 13) <= 24
+
+
 def test_bicep_bootstrap_probe_scaling_cors_and_auth_contract():
     text = (ROOT / "infra/main.bicep").read_text()
     assert "targetPort: useAcrImage ? 8000 : 80" in text

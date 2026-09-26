@@ -1,9 +1,10 @@
 // Infrastructure for agent-harness.
 //
-// Cost posture: everything here is free-tier or scale-to-zero.
+// Cost posture: low idle cost, not zero total cost. ACR Basic has a paid baseline.
+// A daily log quota is not a hard monthly currency cap.
 //   Static Web Apps  Free   -> $0
 //   Container Apps   min=0  -> $0 idle, ~$0-5/mo active
-//   Log Analytics    capped -> $0-3/mo
+//   Log Analytics    capped -> usage billed; set Azure budget alerts
 //   Storage (Tables)        -> pennies
 // Deliberately NO Postgres: a B1ms Flexible Server would be ~$13/mo, more than
 // every other line item combined.
@@ -13,7 +14,7 @@ targetScope = 'resourceGroup'
 @description('Base name for all resources.')
 param name string = 'agentharness'
 
-@description('Location. Must support the Foundry Responses API.')
+@description('Location for app infrastructure; model availability is verified separately.')
 @allowed([
   'centralus'
   'eastus'
@@ -33,12 +34,15 @@ which only exists after the app is created. And on a brand-new registry the
 image has not been pushed yet regardless.
 
 So: deploy once with the public placeholder, then let the backend workflow
-build and push the real image via `az containerapp update`.
+build the real image and apply it with scripts/deploy.py.
 ''')
 param containerImage string = 'mcr.microsoft.com/k8se/quickstart:latest'
 
 @description('True once a real image exists in ACR. Enables the ACR registry binding.')
 param useAcrImage bool = false
+
+@description('Preserve in what-if; refresh on real deployment so token rotations take effect.')
+param revisionSuffix string = ''
 
 @description('Server-only bearer token. Required for a real image; scripts/deploy.py validates strength.')
 @secure()
@@ -89,7 +93,7 @@ resource acr 'Microsoft.ContainerRegistry/registries@2023-11-01-preview' = {
 // Thread persistence -- Table Storage, not Postgres
 // ---------------------------------------------------------------------------
 resource storage 'Microsoft.Storage/storageAccounts@2023-05-01' = {
-  name: 'st${name}${uniq}'
+  name: 'st${take(name, 9)}${uniq}'
   location: location
   sku: { name: 'Standard_LRS' }
   kind: 'StorageV2'
@@ -131,12 +135,13 @@ resource api 'Microsoft.App/containerApps@2024-03-01' = {
         allowInsecure: false
       }
       // Bootstrap identity must exist before AcrPull can be assigned.
-      registries: union(runtimeConfig.registries, useAcrImage ? [
+      // Azure adds null credential fields; replace by server, not whole-object equality.
+      registries: useAcrImage ? concat(filter(runtimeConfig.registries, registry => registry.server != acr.properties.loginServer), [
         {
           server: acr.properties.loginServer
           identity: 'system'
         }
-      ] : [])
+      ]) : runtimeConfig.registries
       secrets: concat(runtimeConfig.secrets, [
         {
           name: 'tables-connection'
@@ -145,6 +150,7 @@ resource api 'Microsoft.App/containerApps@2024-03-01' = {
       ], useAcrImage ? [{ name: 'app-access-token', value: appAccessToken }] : [])
     }
     template: {
+      revisionSuffix: revisionSuffix
       containers: [
         {
           name: 'api'

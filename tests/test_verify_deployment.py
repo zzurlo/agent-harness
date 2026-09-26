@@ -1,7 +1,7 @@
 import importlib.util
 import json
-from pathlib import Path
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -40,7 +40,7 @@ def test_runtime_verifier_checks_health_gate_and_all_routes(ready):
     assert url.endswith("/admin/verify-models")
     assert kwargs["method"] == "POST"
     assert kwargs["token"] == TOKEN
-    assert kwargs["timeout"] == 900
+    assert kwargs["timeout"] == 180
     assert not kwargs.get("data")  # No route filter: server probes all configured routes.
 
 

@@ -6,8 +6,9 @@ requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.32",
-    "openai>=2.0,<3",  # async callable api_key; tested v2 Chat Completions surface,
+    "openai>=2.0,<3",  # async callable api_key; tested v2 Chat Completions surface
     "azure-identity>=1.19",
+    "aiohttp>=3.10,<4",  # azure-identity's async HTTP transport is opt-in
     "azure-data-tables>=12.5",
     "httpx>=0.27",
     "pydantic>=2.9",
@@ -42,4 +43,4 @@ ignore = [
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["harness*", "api*"]
+include = ["harness*", "api*", "scripts*"]

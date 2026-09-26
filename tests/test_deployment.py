@@ -97,8 +97,11 @@ def test_image_update_binds_system_identity_before_patch_and_uses_private_body(m
     monkeypatch.setenv("AZURE_SUBSCRIPTION_ID", "test-subscription")
     calls = []
     state = live()
+    state["properties"]["configuration"]["maxInactiveRevisions"] = 7
     def az(args):
         calls.append(args)
+        if args[:2] == ["staticwebapp", "show"]:
+            return "ui.azurestaticapps.net"
         if args[:2] == ["containerapp", "show"]:
             return state
         if "listSecrets" in " ".join(args):
@@ -111,6 +114,9 @@ def test_image_update_binds_system_identity_before_patch_and_uses_private_body(m
             assert config["ingress"]["targetPort"] == 8000
             assert config["activeRevisionsMode"] == "Single"
             assert payload["properties"]["template"]["scale"]["maxReplicas"] == 1
+            env = {e["name"]: e for e in payload["properties"]["template"]["containers"][0]["env"]}
+            assert env["CORS_ORIGINS"]["value"] == "https://ui.azurestaticapps.net"
+            assert config["maxInactiveRevisions"] == 7
             state["properties"]["latestReadyRevisionName"] = "ca-api--" + payload["properties"]["template"]["revisionSuffix"]
         return {}
     d.deploy_backend("rg", "ca-api", "example.azurecr.io/api:sha", ENV, az=az)

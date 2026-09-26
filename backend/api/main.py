@@ -14,16 +14,18 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
-
-from api.auth import OwnerAuthMiddleware
 from harness.config import settings
 from harness.context import Conversation
 from harness.loop import Harness, approvals, generate_title
 from harness.persistence import new_thread_id, store
+from harness.providers import foundry
 from harness.router import route_table
 from harness.tools import builtin  # noqa: F401 - registers tools on import
 from harness.tools.registry import registry
+from pydantic import BaseModel, Field
+
+from api.auth import OwnerAuthMiddleware
+from api.verification import router as verification_router
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 log = logging.getLogger("api")
@@ -36,10 +38,14 @@ async def lifespan(app: FastAPI):
         len(registry),
         [r["route"] for r in route_table()],
     )
-    yield
+    try:
+        yield
+    finally:
+        await foundry.close_client()
 
 
 app = FastAPI(title="agent-harness", version="0.1.0", lifespan=lifespan)
+app.include_router(verification_router)
 
 # Last registered is outermost: CORS validates preflights and decorates 401/503.
 app.add_middleware(OwnerAuthMiddleware)

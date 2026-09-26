@@ -300,8 +300,13 @@ def render(results: list[RouteResult]) -> None:
         print(f"{GREEN}All {len(results)} routes usable{extra}.{RESET}\n")
 
 
+class ConfigurationParser(argparse.ArgumentParser):
+    def error(self, message):
+        raise ValueError(message)
+
+
 async def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = ConfigurationParser(description=__doc__)
     parser.add_argument("--route", action="append", choices=sorted(ROUTES),
                         help="Only check this route (repeatable).")
     parser.add_argument("--timeout", type=float, default=30.0,
@@ -312,7 +317,16 @@ async def main() -> int:
                         help="Skip the tool-calling probe.")
     parser.add_argument("--json", action="store_true",
                         help="Emit JSON instead of a table.")
-    args = parser.parse_args()
+    try:
+        args = parser.parse_args()
+    except ValueError as exc:
+        results = [RouteResult("configuration", "", False,
+                               errors=[str(exc)[:300]], configuration_error=True)]
+        if "--json" in sys.argv:
+            print(json.dumps([r.as_dict() for r in results]))
+        else:
+            render(results)
+        return 2
 
     try:
         if _IMPORT_ERROR is not None:

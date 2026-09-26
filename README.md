@@ -1,192 +1,101 @@
 # agent-harness
 
-A ChatGPT-style chat app built on a **hand-written agent harness** over Microsoft Foundry models.
+A private, single-owner ChatGPT-style app with a **hand-written agent harness** over Microsoft Foundry models. React/Vite frontend, FastAPI/SSE backend, Azure Table Storage for conversations. This is not a Microsoft Agent Framework implementation; an optional adapter remains future work.
 
-The point of this repo isn't the chat UI — it's the harness. The model just emits tokens; everything that turns that into a useful assistant is code you own:
+The harness owns model/tool execution, context compaction, per-turn budgets, structured tool errors, approval gates, and tiered routing. No OpenAI/Anthropic model deployment is required: the OpenAI **client library/protocol** is used to call compatible Foundry-hosted models.
 
-- the **loop** (model → tool calls → results → model)
-- **context compaction** when history outgrows the window
-- **budgets** so a confused model can't run forever
-- **structured error recovery** so tool failures are recoverable, not fatal
-- **approval gates** for dangerous tools
-- **cost-aware routing** across model tiers
+## Deployment status and safety
 
-## Cost posture
+Build/test success is not a live deployment. Follow **[docs/DEPLOY.md](docs/DEPLOY.md)** for the ordered setup and verification gates.
 
-Built to run for **~$5–25/month**.
+- PRs and main pushes run tests/builds only. **All Azure deployments require manual workflow dispatch from `main`.** Merging does not provision resources.
+- Infrastructure defaults to **what-if**, not deploy. Privileged PR previews are disabled; GitHub OIDC trusts main only.
+- Use `scripts/deploy.py` for infrastructure reruns. It preserves the live image and runtime configuration, rather than restoring a bootstrap image.
+- Bootstrap serves the public quickstart on port 80. The real backend serves on 8000, using its system identity for ACR pulls.
+- `minReplicas=0`, `maxReplicas=1`, one worker and Single revision mode: approvals are currently process-local. Do not scale out until approval state is shared.
 
-| Component | Choice | Cost |
-|---|---|---|
-| Frontend | Azure Static Web Apps, **Free** tier | $0 |
-| Backend | Container Apps, Consumption, **min-replicas 0** | $0 idle, ~$0–5/mo |
-| Inference | Foundry serverless, tiered routing | ~$2–15/mo |
-| Threads | Azure Table Storage | pennies |
-| Logs | Log Analytics, capped 0.5 GB/day | $0–3/mo |
+## Private access
 
-Two deliberate omissions:
+Set a cryptographically random **`APP_ACCESS_TOKEN` of at least 32 non-whitespace characters** on the backend. Enter the same key into the browser's unlock form. This is one owner's private workspace, not multi-user accounts.
 
-- **No Postgres.** A B1ms Flexible Server is ~$13/mo — more than everything else combined. Table Storage does the job.
-- **No SWA Standard tier.** Its "linked backend" proxy costs $9/mo; the frontend calls the Container App directly with CORS instead.
+- All API routes (including thread read/delete, approvals, docs and model verification) require `Authorization: Bearer ...`.
+- Only GET `/health`, GET `/warmup`, and valid CORS preflights are public.
+- Missing/short configuration fails closed with 503; invalid credentials receive 401.
+- The browser keeps the key in memory only, never localStorage/sessionStorage or the build. Refresh requires unlocking again. Logout aborts requests and clears private UI state; it does not delete stored threads or rotate the server key.
+- **Never put the key in `VITE_*`, URLs, git, screenshots, or chat messages.** Use HTTPS outside local development. Backend CORS is limited to the explicit frontend origin, but CORS is not authentication.
 
-### Cold starts
+## Foundry configuration
 
-`minReplicas: 0` means ~$0 at idle and a 3–10s cold start. The frontend fires `GET /warmup` on page load, so the container is warming while the user types their first message. The dot in the header shows warm state.
+Use **`FOUNDRY_MODEL_ENDPOINT`** with the direct resource model URL copied from the deployment, for example:
 
-## Model routing
-
-Every turn picks the cheapest model that can actually do the job. This is the biggest cost lever in the project.
-
-| Route | Default model | $/1M in | $/1M out | When |
-|---|---|---|---|---|
-| `fast` | Phi-4-mini-reasoning | 0.08 | 0.32 | titles, compaction summaries, trivial turns |
-| `chat` | Llama-3.3-70B-Instruct | 0.20 | 0.60 | **default** — non-reasoning conversation |
-| `tools` | grok-4.1-fast-reasoning | 0.20 | 0.50 | any turn with tool calls |
-| `think` | DeepSeek-V4-Flash | 0.19 | 0.51 | "think hard", or >100k token history (1M ctx) |
-| `max` | DeepSeek-V3.2 | 0.58 | 1.68 | opt-in escalation only |
-
-Swap any of these with `MODEL_FAST`, `MODEL_CHAT`, … env vars — no code changes.
-
-**Why `chat` is not a reasoning model:** reasoning models bill hidden thinking tokens at the output rate and add seconds of latency. Most turns are conversation, not proof-solving. Routing them to a plain instruct model is worth more than any other optimization here.
-
-**Why `tools` is Grok 4.1 Fast Reasoning:** it's cheap *and* explicitly tool-calling capable. Models that silently ignore tool schemas will waste your afternoon. The harness only advertises tools to routes flagged `supports_tools`.
-
-> Prices are directional. Verify in the Foundry catalog for your region at deploy time — serverless pricing varies by region and changes.
-
-## Architecture
-
-```
-┌──────────────────────────────────────────┐
-│  React / Vite on Static Web Apps (Free)  │
-│   warmup ping · SSE stream · approvals   │
-└───────────────┬──────────────────────────┘
-                │ POST /chat (CORS, SSE)
-┌───────────────▼──────────────────────────┐
-│  Container Apps · min-replicas 0         │
-│  ┌────────────────────────────────────┐  │
-│  │ HARNESS                            │  │
-│  │  router   → cheapest capable tier  │  │
-│  │  loop     → model ⇄ tools          │  │
-│  │  context  → compaction             │  │
-│  │  budgets  → calls/time/tokens      │  │
-│  │  registry → schemas + safe dispatch│  │
-│  └────────────────────────────────────┘  │
-└───────────────┬──────────────────────────┘
-                │ OpenAI-compatible v1 API
-┌───────────────▼──────────────────────────┐
-│  Microsoft Foundry — serverless models   │
-└──────────────────────────────────────────┘
+```text
+https://<resource>.openai.azure.com/openai/v1
 ```
 
-## Layout
+A project URL such as `/api/projects/<project>` is **not** a Chat Completions model endpoint. The legacy `FOUNDRY_PROJECT_ENDPOINT` variable is accepted only if it already contains a valid model URL, with a deprecation warning. API keys are optional for local testing; production uses an async, refreshing managed-identity credential.
 
-```
-backend/
-  harness/
-    config.py       routes, budgets, context policy (all env-overridable)
-    router.py       route selection
-    loop.py         THE LOOP — streaming, tools, budgets, approvals
-    context.py      token accounting + compaction
-    persistence.py  Table Storage / in-memory threads
-    providers/
-      foundry.py    Foundry client (API key or managed identity)
-    tools/
-      registry.py   decorator registration, schema gen, safe dispatch
-      builtin.py    example tools
-  api/main.py       FastAPI + SSE
-  scripts/verify_models.py  pre-deploy route verification
-  tests/            34 tests, no network required
-frontend/           React + Vite
-infra/main.bicep    RG-scoped: ACA env, SWA, ACR, Storage, capped logs
-.github/workflows/  OIDC deploy for backend + frontend
-```
+Five deployment names are configurable: `MODEL_FAST`, `MODEL_CHAT`, `MODEL_TOOLS`, `MODEL_THINK`, `MODEL_MAX`. Keep `chat` non-reasoning for cost and latency; `tools` must actually call functions. Code defaults are examples, **not verified availability or pricing**. Production deployment requires explicit names for all five; several tiers may point at the same compatible model. Capability flags/output budgets/prices remain in `backend/harness/config.py` and must agree with the chosen models.
+
+The protected `POST /admin/verify-models` checks the **running backend's identity and configuration**, sequentially and with bounded request/overall budgets. It returns `{ready, results}`. `ready: false` is a failure even with HTTP 200. This is a paid inference probe. Deployment verification requires health, denied anonymous thread access, and all configured routes ready; CI's deployment identity is never substituted for runtime credentials.
 
 ## Local development
 
+Python 3.11+ and Node `^20.19.0 || >=22.12.0`. Commands below are Bash (Linux, macOS, or Git Bash with appropriate Python/venv paths):
+
 ```bash
-# Backend
 cd backend
-python -m venv .venv && source .venv/bin/activate
-pip install -e ".[dev]"
-cp .env.example .env          # fill in FOUNDRY_PROJECT_ENDPOINT
+python -m venv .venv
+# On Git Bash/Windows: source .venv/Scripts/activate
+source .venv/bin/activate
+pip install -e '.[dev]'
+cp .env.example .env
+# Edit .env locally: real model endpoint/names, optional API key, private owner key.
+# The app reads process environment; copying .env alone does not load it.
+set -a; source .env; set +a
 uvicorn api.main:app --reload --port 8000
-
-# Frontend (separate shell)
-cd frontend
-npm install
-npm run dev                   # http://localhost:5173
 ```
 
-Tests need no Foundry deployment:
+In another terminal:
 
 ```bash
-cd backend && pytest -q       # 34 passed
+cd frontend
+npm ci
+npm run dev
 ```
 
-### Verify your model deployments
+Open `http://localhost:5173` and unlock. The warmup request starts the backend before your first message. Local model verification: `cd backend && python scripts/verify_models.py --json`; route filtering, `--timeout`, and `--total-timeout` are supported. `--skip-tools` is diagnostic only, not a production readiness check.
 
-Before deploying, confirm every route actually works:
+## Tests
 
 ```bash
 cd backend
-export FOUNDRY_PROJECT_ENDPOINT="https://<res>.services.ai.azure.com/api/projects/<proj>"
-python scripts/verify_models.py
+pip install -e '.[dev]'
+pytest -q
+ruff check .
+cd ..
+pip install pytest pyyaml
+python -m pytest tests -q
+az bicep build --file infra/main.bicep --outfile /tmp/main.json
+az bicep lint --file infra/main.bicep
+cd frontend
+npm ci
+npm test
+npm run build
 ```
 
-Probes each route for reachability, and — for tool-flagged routes — whether it
-actually emits a tool call. That second check is the important one: a model that
-accepts your tool schema and silently ignores it throws no error anywhere. Your
-agent loop just never calls a tool, and you find out mid-conversation.
+Docker dependencies come from the same `pyproject.toml` as CI, including the async identity transport and packaged runtime verifier.
 
-See [docs/DEPLOY.md](docs/DEPLOY.md) for flags and the full deploy runbook.
+## Cost posture
 
-## Deploy
+- SWA Free; ACA Consumption scaled to zero when idle.
+- **ACR Basic has a paid baseline**: September 2026 centralus retail pricing was USD 0.1666/day, about USD 5 for 30 days, before extra usage. Recheck Azure pricing.
+- Table Storage, inference, registry tasks, and logs are usage-billed. No Postgres.
+- Log Analytics has a 0.5 GB/day ingestion quota, **not a hard monthly dollar ceiling**. Configure Azure budget alerts and verify actual spending. Earlier blanket `$5–25/month` estimates are not a guarantee.
 
-```bash
-az group create -n rg-agent-harness -l centralus
+## Known limits / next work
 
-az deployment group create \
-  -g rg-agent-harness \
-  -f infra/main.bicep \
-  -p foundryProjectEndpoint="https://<res>.services.ai.azure.com/api/projects/<proj>" \
-     corsOrigins="https://<your-swa>.azurestaticapps.net"
-```
-
-Then set repo secrets: `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID`, `ACR_NAME`, `AZURE_STATIC_WEB_APPS_API_TOKEN`, `VITE_API_BASE`.
-
-The Container App's managed identity needs the **Foundry User** role on the Foundry project (note: the Azure AI User/Owner roles were renamed to Foundry User/Owner; role IDs are unchanged).
-
-## Adding a tool
-
-```python
-from harness.tools.registry import registry
-
-@registry.register()
-def lookup_order(order_id: str) -> dict:
-    """Look up an order by ID."""      # docstring -> tool description
-    return {"id": order_id, "status": "shipped"}
-
-@registry.register(dangerous=True)     # pauses loop, asks the UI first
-def refund(order_id: str, amount: float) -> dict:
-    """Issue a refund."""
-    ...
-```
-
-The JSON schema is derived from type hints; required params come from which args lack defaults.
-
-## Design notes
-
-**Tool errors are data, not exceptions.** `dispatch()` never raises — it returns `{"error": ..., "retryable": bool}`. A model that sees a structured error adapts; a model that sees a stack trace flails.
-
-**Compaction never orphans tool messages.** The split point walks backwards past `tool` messages and their parent `tool_calls` assistant message. Splitting mid-group produces payloads the API rejects — there's a test for this.
-
-**Budgets are hard stops.** Max tool calls per turn, wall-clock, tokens, and per-tool timeout. Exceeding one emits `budget_exceeded` and closes the stream cleanly rather than hanging.
-
-**Tools are only advertised to capable routes.** Reasoning-tagged ≠ tool-calling-capable.
-
-## Roadmap
-
-- [ ] Microsoft Agent Framework adapter as an alternate provider (it's a supported framework for Foundry **hosted agents**, which would also give per-agent Entra identity and session state)
-- [ ] Prompt caching hints for models that support it — the system prompt + history is most of your input spend
-- [ ] Streaming tool results
-- [ ] Thread list / switcher in the UI
-- [ ] Entra auth via SWA's built-in provider (free on the Free tier)
+- Authentication is a single shared owner key, not Entra user login or per-user thread isolation.
+- Thread switcher, prompt-cache optimization, distributed approvals and streaming tool results remain future work.
+- Pending approvals do not survive restarts; single-replica operation avoids cross-replica routing but not restart loss.
+- Conversation persistence still stores one JSON string per thread. Long conversations can hit Azure Table property limits; storage reliability/large-thread handling needs further work.
+- Unit tests and local container probes do not validate Azure permissions, regional capacity, Foundry model support, or end-to-end cloud persistence. Those gates run after deliberate provisioning.

@@ -21,7 +21,7 @@ def curl(url, *, method="GET", token=None, timeout=20):
             "--write-out", "\n%{http_code}", url]
     try:
         result = subprocess.run(args, input=config, capture_output=True,
-                                text=True, timeout=timeout + 15)
+                                text=True, timeout=timeout + 15, check=False)
     except subprocess.TimeoutExpired:
         return 0, {}
     if result.returncode:
@@ -34,7 +34,7 @@ def curl(url, *, method="GET", token=None, timeout=20):
     return int(status), payload
 
 
-def verify(base, token, *, model_timeout=900, request=curl):
+def verify(base, token, *, model_timeout=180, request=curl):
     parsed = urlsplit(base)
     if (parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password
             or parsed.query or parsed.fragment or parsed.path not in ("", "/")):
@@ -64,11 +64,11 @@ def verify(base, token, *, model_timeout=900, request=curl):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--url", required=True)
-    parser.add_argument("--model-timeout", type=int, default=900,
-                        help="Total seconds for the server's sequential all-route probe")
+    parser.add_argument("--model-timeout", type=int, default=180,
+                        help="Seconds for the server's bounded all-route probe (below the ingress request budget)")
     args = parser.parse_args()
-    if not 1 <= args.model_timeout <= 1800:
-        parser.error("--model-timeout must be between 1 and 1800")
+    if not 1 <= args.model_timeout <= 230:
+        parser.error("--model-timeout must be between 1 and 230 (ingress timeout safety)")
     verify(args.url, os.environ.get("APP_ACCESS_TOKEN", ""), model_timeout=args.model_timeout)
 
 
